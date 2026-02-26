@@ -39,18 +39,31 @@ static bool  LINKS_CURVED       = true;     // press 'C' to toggle
 static int   LINK_SAMPLES       = 28;
 
 static void* LABEL_STROKE_FONT  = GLUT_STROKE_ROMAN;
-static float LABEL_STROKE_SCALE = 0.04f;
-static float LABEL_RADIAL_PAD_PX= 12.0f;    // screen-space pad from node outward
+
+// Stroke units are roughly ~100 tall for GLUT_STROKE_ROMAN.
+// We'll compute a world-space scale per label so they remain readable.
+static float LABEL_BASE_SCALE_PER_DIST = 0.00001f;  // distance -> scale factor
+static float LABEL_SCALE_MIN = 0.02f;
+static float LABEL_SCALE_MAX = 0.02f;
+
+// How far "above" the sphere to draw glyphs to avoid z-fighting, while still depth-tested.
+static float LABEL_SURFACE_EPSILON = 0.85f;
+
+// How far from the node endpoint (along the label direction on the sphere surface)
+// to start the label. This is a geodesic distance measured in WORLD UNITS along the sphere.
+static float LABEL_START_OFFSET_WORLD = 3.0f;
+
+// Extra spacing between glyphs as a fraction of each glyph's nominal advance.
+static float LABEL_GLYPH_SPACING = 0.06f;
+
+// Slight fade so labels feel blended into the sphere surface.
+static float LABEL_ALPHA = 0.60f;
 
 static float ENDPOINT_RADIUS    = 1.0f;
 
 static float BASE_CAM_DIST      = 900.0f;
 
 static bool  DRAW_WIREFRAME_SPHERE = true;
-
-// Label orientation: vertical top->bottom means rotate baseline so +X points DOWN screen.
-// In our ortho overlay: +Y is UP, so rotate -90 degrees.
-static const float LABEL_VERTICAL_ANGLE_DEG = -90.0f;
 
 // ---------------------------- Data Model ----------------------------
 
@@ -101,19 +114,32 @@ static float clampf(float v, float lo, float hi) {
     return std::max(lo, std::min(hi, v));
 }
 
-static void normalize3(float& x, float& y, float& z) {
-    float len = std::sqrt(x*x + y*y + z*z);
-    if (len > 1e-9f) { x /= len; y /= len; z /= len; }
-}
-
 static float dot3(float ax, float ay, float az, float bx, float by, float bz) {
     return ax*bx + ay*by + az*bz;
 }
 
-// Multiply OpenGL column-major 4x4 matrix by point [x y z 1]^T -> (ox,oy,oz)
+static void cross3(float ax, float ay, float az,
+                   float bx, float by, float bz,
+                   float& ox, float& oy, float& oz)
+{
+    ox = ay*bz - az*by;
+    oy = az*bx - ax*bz;
+    oz = ax*by - ay*bx;
+}
+
+static float len3(float x, float y, float z) {
+    return std::sqrt(x*x + y*y + z*z);
+}
+
+static void normalize3(float& x, float& y, float& z) {
+    float l = len3(x,y,z);
+    if (l > 1e-9f) { x/=l; y/=l; z/=l; }
+}
+
 static void multMatPoint3(const GLdouble* m, double x, double y, double z,
                           double& ox, double& oy, double& oz)
 {
+    // column-major
     ox = m[0]*x + m[4]*y + m[8]*z  + m[12];
     oy = m[1]*x + m[5]*y + m[9]*z  + m[13];
     oz = m[2]*x + m[6]*y + m[10]*z + m[14];
@@ -141,57 +167,41 @@ static bool isPointOnVisibleHemisphere_EyeSpace(double px, double py, double pz,
     return (nx*vx + ny*vy + nz*vz) > 0.0;
 }
 
-// Slerp between two direction vectors (normalized) -> normalized
-static void slerpDir(float ax, float ay, float az,
-                     float bx, float by, float bz,
-                     float t,
-                     float& ox, float& oy, float& oz)
+// Move on a unit sphere by arc length "a" (radians) along a tangent direction d (unit, perpendicular to p).
+// Great-circle step:
+//   p' = cos(a)*p + sin(a)*d
+// and parallel-transport the tangent direction:
+//   d' = cos(a)*d - sin(a)*p
+static void greatCircleStep(float a,
+                            float& px, float& py, float& pz,
+                            float& dx, float& dy, float& dz)
 {
-    normalize3(ax, ay, az);
-    normalize3(bx, by, bz);
+    float ca = std::cos(a);
+    float sa = std::sin(a);
 
-    float d = clampf(dot3(ax, ay, az, bx, by, bz), -1.0f, 1.0f);
-    float omega = std::acos(d);
-    if (omega < 1e-6f) { ox = ax; oy = ay; oz = az; return; }
+    float npx = ca*px + sa*dx;
+    float npy = ca*py + sa*dy;
+    float npz = ca*pz + sa*dz;
 
-    float so = std::sin(omega);
-    float s0 = std::sin((1.0f - t) * omega) / so;
-    float s1 = std::sin(t * omega) / so;
+    float ndx = ca*dx - sa*px;
+    float ndy = ca*dy - sa*py;
+    float ndz = ca*dz - sa*pz;
 
-    ox = s0*ax + s1*bx;
-    oy = s0*ay + s1*by;
-    oz = s0*az + s1*bz;
-    normalize3(ox, oy, oz);
+    px = npx; py = npy; pz = npz;
+    dx = ndx; dy = ndy; dz = ndz;
+
+    // numeric cleanup
+    normalize3(px,py,pz);
+    // keep d tangent
+    float proj = px*dx + py*dy + pz*dz;
+    dx -= proj*px; dy -= proj*py; dz -= proj*pz;
+    normalize3(dx,dy,dz);
 }
 
 // ---------------------------- Stroke Text ----------------------------
 
-enum class TextAlign { Start, Center, End };
-
-static float strokeTextWidth(void* font, const std::string& s) {
-    float w = 0.0f;
-    for (unsigned char c : s) w += float(glutStrokeWidth(font, c));
-    return w;
-}
-
-static void drawStrokeStringRotatedAligned(float x, float y,
-                                           float angleDeg,
-                                           float scale,
-                                           void* font,
-                                           const std::string& s,
-                                           TextAlign align)
-{
-    glPushMatrix();
-    glTranslatef(x, y, 0.0f);
-    glRotatef(angleDeg, 0.0f, 0.0f, 1.0f);
-    glScalef(scale, scale, 1.0f);
-
-    float w = strokeTextWidth(font, s);
-    if (align == TextAlign::Center) glTranslatef(-0.5f * w, 0.0f, 0.0f);
-    else if (align == TextAlign::End) glTranslatef(-w, 0.0f, 0.0f);
-
-    for (unsigned char c : s) glutStrokeCharacter(font, c);
-    glPopMatrix();
+static float strokeCharAdvance(void* font, unsigned char c) {
+    return float(glutStrokeWidth(font, c));
 }
 
 // ---------------------------- XML Parsing (FreeMind) ----------------------------
@@ -305,6 +315,28 @@ static void markVisibilityRecursive(Node* n, const GLdouble* model, const double
 
 // ---------------------------- Link Drawing (visibility-aware) ----------------------------
 
+static void slerpDir(float ax, float ay, float az,
+                     float bx, float by, float bz,
+                     float t,
+                     float& ox, float& oy, float& oz)
+{
+    normalize3(ax, ay, az);
+    normalize3(bx, by, bz);
+
+    float d = clampf(dot3(ax, ay, az, bx, by, bz), -1.0f, 1.0f);
+    float omega = std::acos(d);
+    if (omega < 1e-6f) { ox = ax; oy = ay; oz = az; return; }
+
+    float so = std::sin(omega);
+    float s0 = std::sin((1.0f - t) * omega) / so;
+    float s1 = std::sin(t * omega) / so;
+
+    ox = s0*ax + s1*bx;
+    oy = s0*ay + s1*by;
+    oz = s0*az + s1*bz;
+    normalize3(ox, oy, oz);
+}
+
 static void drawLinkStraight(const Node* parent, const Node* child) {
     glBegin(GL_LINES);
     glVertex3f(parent->x, parent->y, parent->z);
@@ -353,49 +385,119 @@ static void drawSpheresRecursiveVisible(const Node* n) {
     for (const auto& ch : n->children) drawSpheresRecursiveVisible(ch.get());
 }
 
-// ---------------------------- Label Drawing (2D overlay, vertical top->bottom) ----------------------------
+// ---------------------------- Label Drawing (WRAPPED onto sphere surface) ----------------------------
 
-static void drawLabelsRecursive_Overlay2D(const Node* n,
-                                         const GLdouble* model,
-                                         const GLdouble* proj,
-                                         const GLint* viewport,
-                                         float centerSX, float centerSY)
+static void drawOneLabelWrappedOnSphere(const Node* n, const GLdouble* model)
+{
+    // Unit normal at node position (sphere center at origin)
+    float px = n->x / SPHERE_RADIUS;
+    float py = n->y / SPHERE_RADIUS;
+    float pz = n->z / SPHERE_RADIUS;
+    normalize3(px, py, pz);
+
+    // Choose local "down" direction as projection of world -Y onto the tangent plane.
+    float dx = 0.0f, dy = -1.0f, dz = 0.0f;
+    float proj = dx*px + dy*py + dz*pz;
+    dx -= proj*px; dy -= proj*py; dz -= proj*pz;
+    float dlen = len3(dx,dy,dz);
+    if (dlen < 1e-6f) {
+        // near poles: project world +Z instead
+        dx = 0.0f; dy = 0.0f; dz = 1.0f;
+        proj = dx*px + dy*py + dz*pz;
+        dx -= proj*px; dy -= proj*py; dz -= proj*pz;
+        dlen = len3(dx,dy,dz);
+    }
+    if (dlen < 1e-6f) {
+        dx = 1.0f; dy = 0.0f; dz = 0.0f;
+    } else {
+        dx/=dlen; dy/=dlen; dz/=dlen;
+    }
+
+    // Compute eye-space distance to scale the label (stable with zoom/camera distance).
+    double ex, ey, ez;
+    multMatPoint3(model, (double)n->x, (double)n->y, (double)n->z, ex, ey, ez);
+    float dist = float(std::sqrt(ex*ex + ey*ey + ez*ez));
+
+    float scale = clampf(dist * LABEL_BASE_SCALE_PER_DIST, LABEL_SCALE_MIN, LABEL_SCALE_MAX);
+
+    // Start marching from node endpoint, but offset a bit along label direction (configurable).
+    // Convert world distance along surface to arc radians.
+    float startOffsetArc = (LABEL_START_OFFSET_WORLD / SPHERE_RADIUS);
+
+    float ptx = px, pty = py, ptz = pz;
+    float dtx = dx, dty = dy, dtz = dz;
+
+    if (std::fabs(startOffsetArc) > 1e-9f) {
+        greatCircleStep(startOffsetArc, ptx, pty, ptz, dtx, dty, dtz);
+    }
+
+    glColor4f(0.10f, 0.10f, 0.10f, LABEL_ALPHA);
+
+    for (unsigned char c : n->text) {
+        float adv = strokeCharAdvance(LABEL_STROKE_FONT, c);
+        float glyphWorldLen = adv * scale;
+        float glyphArc = glyphWorldLen / SPHERE_RADIUS;
+
+        // Place glyph at mid of its advance for nicer spacing
+        float midStep = 0.5f * glyphArc;
+        float pcharx = ptx, pchary = pty, pcharz = ptz;
+        float dcharx = dtx, dchary = dty, dcharz = dtz;
+        greatCircleStep(midStep, pcharx, pchary, pcharz, dcharx, dchary, dcharz);
+
+        // Local normal = pchar (unit)
+        float nx = pcharx, ny = pchary, nz = pcharz;
+        normalize3(nx, ny, nz);
+
+        // Baseline direction for GLUT stroke (+X) is our "down" tangent => top->bottom.
+        float bx = dcharx, by = dchary, bz = dcharz;
+        normalize3(bx, by, bz);
+
+        // Build a right-handed frame: X = baseline (down), Z = normal, Y = Z x X
+        float yx, yy, yz;
+        cross3(nx, ny, nz, bx, by, bz, yx, yy, yz);
+        normalize3(yx, yy, yz);
+
+        // Re-orthonormalize X = Y x Z (helps drift)
+        cross3(yx, yy, yz, nx, ny, nz, bx, by, bz);
+        normalize3(bx, by, bz);
+
+        // World position (slightly above surface to avoid z-fighting but still depth-tested)
+        float wx = (pcharx * SPHERE_RADIUS) + nx * LABEL_SURFACE_EPSILON;
+        float wy = (pchary * SPHERE_RADIUS) + ny * LABEL_SURFACE_EPSILON;
+        float wz = (pcharz * SPHERE_RADIUS) + nz * LABEL_SURFACE_EPSILON;
+
+        GLfloat M[16] = {
+            bx,    by,    bz,    0.0f,
+            yx,    yy,    yz,    0.0f,
+            nx,    ny,    nz,    0.0f,
+            0.0f,  0.0f,  0.0f,  1.0f
+        };
+
+        glPushMatrix();
+        glTranslatef(wx, wy, wz);
+        glMultMatrixf(M);
+        glScalef(scale, scale, 1.0f);
+
+        glutStrokeCharacter(LABEL_STROKE_FONT, c);
+
+        glPopMatrix();
+
+        // Advance to next glyph start: step by glyphArc plus spacing
+        float stepArc = glyphArc * (1.0f + LABEL_GLYPH_SPACING);
+        greatCircleStep(stepArc, ptx, pty, ptz, dtx, dty, dtz);
+    }
+}
+
+static void drawLabelsRecursive_WrappedOnSphere(const Node* n, const GLdouble* model)
 {
     if (n->visible) {
         bool isLeaf = n->children.empty();
         if (!LABEL_LEAVES_ONLY || isLeaf || (n == g_root.get())) {
-
-            GLdouble sx, sy, sz;
-            if (gluProject(n->x, n->y, n->z, model, proj, viewport, &sx, &sy, &sz) == GL_TRUE) {
-                if (sz >= 0.0 && sz <= 1.0) {
-                    float px = float(sx);
-                    float py = float(sy);
-
-                    // Screen-space radial direction from sphere center to node point.
-                    float dx = px - centerSX;
-                    float dy = py - centerSY;
-                    float dlen = std::sqrt(dx*dx + dy*dy);
-                    if (dlen < 1e-6f) { dx = 0.0f; dy = 1.0f; dlen = 1.0f; }
-                    dx /= dlen; dy /= dlen;
-
-                    // Anchor the label slightly outward from the node along the screen-space radial direction.
-                    float lx = px + dx * LABEL_RADIAL_PAD_PX;
-                    float ly = py + dy * LABEL_RADIAL_PAD_PX;
-
-                    // Draw vertical label (top -> bottom). Start-of-string at the anchor.
-                    // (Rotate baseline so +X goes DOWN screen: -90 degrees.)
-                    float scale = LABEL_STROKE_SCALE * g_zoom;
-
-                    glColor4f(0.10f, 0.10f, 0.10f, 1.0f);
-                    drawStrokeStringRotatedAligned(lx, ly, LABEL_VERTICAL_ANGLE_DEG, scale,
-                                                   LABEL_STROKE_FONT, n->text, TextAlign::Start);
-                }
-            }
+            drawOneLabelWrappedOnSphere(n, model);
         }
     }
-
     for (const auto& ch : n->children)
-        drawLabelsRecursive_Overlay2D(ch.get(), model, proj, viewport, centerSX, centerSY);
+        drawLabelsRecursive_WrappedOnSphere(ch.get(), model);
 }
 
 // ---------------------------- Rendering ----------------------------
@@ -427,61 +529,31 @@ static void display() {
 
     setup3D();
 
-    // Grab matrices for visibility + label projection
     GLdouble model[16], proj[16];
     GLint viewport[4];
     glGetDoublev(GL_MODELVIEW_MATRIX, model);
     glGetDoublev(GL_PROJECTION_MATRIX, proj);
     glGetIntegerv(GL_VIEWPORT, viewport);
 
-    // Sphere center in eye space (world center is (0,0,0))
     double cex, cey, cez;
     multMatPoint3(model, 0.0, 0.0, 0.0, cex, cey, cez);
     double centerEye[3] = { cex, cey, cez };
 
-    // Mark visible hemisphere nodes for this frame
     markVisibilityRecursive(g_root.get(), model, centerEye);
 
     if (DRAW_WIREFRAME_SPHERE) {
         glColor4f(0.55f, 0.55f, 0.55f, 0.25f);
         glPushMatrix();
-            glTranslatef(0.0, 0.0, 0.0); // Move sphere to position
-            glRotatef(90.0, 1.0, 0.0, 0.0); // Rotate 90 degrees around x-axis
-            glutWireSphere(SPHERE_RADIUS, 18, 14);; // Draw the sphere
+            glTranslatef(0.0, 0.0, 0.0);
+            glRotatef(90.0, 1.0, 0.0, 0.0);
+            glutWireSphere(SPHERE_RADIUS, 18, 14);
         glPopMatrix();
     }
 
-    // Draw only visible edges + visible endpoint spheres
     drawEdgesRecursiveVisible(g_root.get());
     drawSpheresRecursiveVisible(g_root.get());
 
-    // Compute sphere center in screen space for radial label anchoring
-    GLdouble csxD, csyD, cszD;
-    float centerSX = float(g_winW) * 0.5f;
-    float centerSY = float(g_winH) * 0.5f;
-    if (gluProject(0.0, 0.0, 0.0, model, proj, viewport, &csxD, &csyD, &cszD) == GL_TRUE) {
-        centerSX = float(csxD);
-        centerSY = float(csyD);
-    }
-
-    // Labels as 2D overlay: visible nodes only, oriented vertical top->bottom
-    glDisable(GL_DEPTH_TEST);
-
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    glOrtho(0.0, double(g_winW), 0.0, double(g_winH), -1.0, 1.0);
-
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
-
-    drawLabelsRecursive_Overlay2D(g_root.get(), model, proj, viewport, centerSX, centerSY);
-
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);
+    drawLabelsRecursive_WrappedOnSphere(g_root.get(), model);
 
     glutSwapBuffers();
 }
